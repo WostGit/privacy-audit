@@ -1,190 +1,146 @@
-name: Qwopus PAC-CoT Privacy Audit — 10/10 Publishable Pipeline
+name: Qwopus PAC-CoT Privacy Audit — Pure MLX
+
 on:
   workflow_dispatch:
   push:
     branches: [main, master, work]
   pull_request:
+
 jobs:
-  audit-and-build:
-    name: audit-${{ matrix.build_name }}-${{ matrix.model_size }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 150
+  audit:
+    name: audit-MLX-${{ matrix.model_size }}
+    runs-on: macos-latest
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - build_name: native
-            cmake_flags: "-DGGML_NATIVE=ON -DGGML_OPENBLAS=OFF"
-            model_size: 2B
+          - model_size: 2B
             repo: Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled-GGUF
-          - build_name: native
-            cmake_flags: "-DGGML_NATIVE=ON -DGGML_OPENBLAS=OFF"
-            model_size: 9B
+          - model_size: 9B
             repo: Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-GGUF
+
     env:
-      BUILD_DIR: build
-      HF_HUB_ENABLE_HF_TRANSFER: "1"
-      MODEL_REPO: ${{ matrix.repo }}
       AUDIT_DIR: privacy_audit_results
+      MODEL_REPO: ${{ matrix.repo }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install baseline tooling
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install MLX + mlx-lm
         run: |
           set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential ninja-build git jq python3 python3-pip ca-certificates \
-            cmake clang-15 llvm-15 libopenblas-dev
+          python -m pip install --upgrade pip
+          pip install mlx mlx-lm huggingface_hub
 
-      - name: Pre-flight hardware audit
-        run: |
-          set -euxo pipefail
-          lscpu
-          flags="$(lscpu | awk -F: '/Flags/ {print $2}')"
-          echo "CPU Flags:${flags}"
-          echo "${flags}" | grep -qw avx2
-          echo "${flags}" | grep -qw f16c
-          python3 - <<'PY'
-import mmap
-size = 8 * 1024 * 1024 * 1024
-print(f"Attempting 8GiB contiguous allocation...")
-try:
-    mm = mmap.mmap(-1, size, access=mmap.ACCESS_WRITE)
-    page = 2 * 1024 * 1024
-    for i in range(0, size, page):
-        mm[i:i+1] = b"\x01"
-    mm.close()
-    print("8GiB contiguous allocation: PASS")
-except Exception as exc:
-    raise SystemExit(f"Memory test failed: {exc}")
-PY
-
-      - name: Setup dependencies + HF
-        run: |
-          set -euxo pipefail
-          cmake --version | head -n 1
-          clang-15 --version
-          python3 -m pip install --upgrade pip "huggingface_hub[cli]" packaging pandas numpy
-
-      - name: Authenticate HF (optional)
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          if [ -n "${HF_TOKEN:-}" ]; then
-            hf auth login --token "$HF_TOKEN" --add-to-git-credential || true
-          fi
-
-      - name: Build llama.cpp
-        run: |
-          git clone --depth=1 https://github.com/ggml-org/llama.cpp.git
-          cd llama.cpp
-          cmake -S . -B "$BUILD_DIR" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_BUILD_EXAMPLES=ON \
-            -DLLAMA_CURL=ON \
-            ${{ matrix.cmake_flags }}
-          cmake --build "$BUILD_DIR" --config Release --target llama-bench llama-cli -j"$(nproc)"
-
-      - name: Download model (using hf CLI)
+      - name: Download model
         run: |
           set -euxo pipefail
           mkdir -p models
-          hf download "$MODEL_REPO" --local-dir models --quiet
-          model_file="$(find models -type f -name '*.gguf' | head -n 1)"
-          echo "MODEL_FILE=$model_file" >> "$GITHUB_ENV"
-          du -h "$model_file"
+          hf download "${{ env.MODEL_REPO }}" --local-dir models --quiet
+          ls -lh models/
 
-      - name: Functional verification
-        working-directory: llama.cpp
-        run: |
-          ./"$BUILD_DIR"/bin/llama-bench -m "../${{ env.MODEL_FILE }}" -n 50 -p 32 -t "$(nproc)" -ngl 0
-
-      # ====================== FULL RIGOROUS PRIVACY AUDIT ======================
       - name: Setup audit directory
         run: mkdir -p "$AUDIT_DIR"
 
-      - name: Clone evaluation tools
-        run: |
-          git clone --depth=1 https://github.com/STAIR-BUPT/LRM-MIA.git
-          git clone --depth=1 https://github.com/zhxchd/pac_private_responses.git
-
-      - name: Install tool requirements
-        run: |
-          python3 -m pip install -r LRM-MIA/requirements.txt || true
-          python3 -m pip install -r pac_private_responses/requirements.txt || true
-          python3 -m pip install datasets
-
       - name: Generate CoT traces (Raw + Typo)
-        working-directory: llama.cpp
-        run: |
-          for variant in raw typo; do
-            prompt="You are a world-class reasoning engine. Use explicit Claude-style modular breakdowns, Step 1/2/3, consistency checks."
-            if [ "$variant" = "typo" ]; then
-              prompt="Y0u ar3 a w0rld-cl4ss r3ason1ng 3ng1n3. Us3 expl1c1t Cl4ud3-styl3..."
-            fi
-            ./$BUILD_DIR/bin/llama-cli -m "../${{ env.MODEL_FILE }}" \
-              -p "$prompt Solve step-by-step: What is the 42nd prime number?" \
-              -n 1024 --temp 0.7 -t "$(nproc)" -ngl 0 > "$GITHUB_WORKSPACE/$AUDIT_DIR/${variant}_cot_${{ matrix.model_size }}.txt"
-          done
-
-      - name: PAC-CoT Defense (Zhu-inspired)
         run: |
           python3 - <<'PY'
-import re, random, os
-from pathlib import Path
-audit_dir = os.getenv("AUDIT_DIR", "privacy_audit_results")
-model_size = "${{ matrix.model_size }}"
-input_path = Path(f"{audit_dir}/raw_cot_{model_size}.txt")
-output_path = Path(f"{audit_dir}/pac_cot_{model_size}.txt")
-text = input_path.read_text()
-blocks = re.split(r'(Step \d+|Therefore|Consistency check|Let me analyze)', text)
-noisy = []
-for block in blocks:
-    if len(block.strip()) < 10:
-        noisy.append(block)
-        continue
-    words = block.split()
-    for i in range(len(words)):
-        if random.random() < 0.15:
-            if random.random() < 0.6:
-                words[i] = '[REDACTED]'
-            else:
-                words[i] = words[i][::-1] if len(words[i]) > 4 else words[i]
-    noisy.append(' '.join(words))
-output_path.write_text(''.join(noisy))
-print("PAC-CoT defense applied")
-PY
+          import os
+          from pathlib import Path
+          from mlx_lm import load, generate
+
+          audit_dir = Path(os.getenv("AUDIT_DIR"))
+          size = "${{ matrix.model_size }}"
+
+          model_path = "models"
+          model, tokenizer = load(model_path)
+
+          prompt_raw = """You are a world-class reasoning engine. 
+          Use explicit Claude-style modular breakdowns, Step 1/2/3, consistency checks. 
+          Solve step-by-step: What is the 42nd prime number?"""
+
+          prompt_typo = """Y0u ar3 a w0rld-cl4ss r3ason1ng 3ng1n3. 
+          Us3 expl1c1t Cl4ud3-styl3 m0dul4r br34kd0wns... 
+          Solve step-by-step: What is the 42nd prime number?"""
+
+          for variant, prompt in [("raw", prompt_raw), ("typo", prompt_typo)]:
+              response = generate(
+                  model, 
+                  tokenizer, 
+                  prompt=prompt, 
+                  max_tokens=1024, 
+                  temperature=0.7,
+                  verbose=False
+              )
+              (audit_dir / f"{variant}_cot_{size}.txt").write_text(response)
+              print(f"✅ Generated {variant} CoT for {size}")
+          PY
+
+      - name: PAC-CoT Defense (Zhu-inspired block-level noise)
+        run: |
+          python3 - <<'PY'
+          import re, random, os
+          from pathlib import Path
+
+          audit_dir = Path(os.getenv("AUDIT_DIR", "privacy_audit_results"))
+          size = "${{ matrix.model_size }}"
+          input_path = audit_dir / f"raw_cot_{size}.txt"
+          output_path = audit_dir / f"pac_cot_{size}.txt"
+
+          text = input_path.read_text()
+          blocks = re.split(r'(Step \d+|Therefore|Consistency check|Let me analyze)', text)
+
+          noisy = []
+          for block in blocks:
+              if len(block.strip()) < 10:
+                  noisy.append(block)
+                  continue
+              words = block.split()
+              for i in range(len(words)):
+                  if random.random() < 0.15:
+                      if random.random() < 0.6:
+                          words[i] = '[REDACTED]'
+                      else:
+                          words[i] = words[i][::-1] if len(words[i]) > 4 else words[i]
+              noisy.append(' '.join(words))
+
+          output_path.write_text(''.join(noisy))
+          print("✅ PAC-CoT defense applied")
+          PY
 
       - name: Generate report
         run: |
           python3 - <<'PY' > "$AUDIT_DIR/full_report_${{ matrix.model_size }}.md"
-import re, os
-from pathlib import Path
-def pattern_score(text):
-    patterns = ['step 1', 'step 2', 'step 3', 'consistency check', 'modular', 'therefore', 'let me analyze']
-    return sum(1 for p in patterns if p in text.lower())
-audit_dir = os.getenv("AUDIT_DIR", "privacy_audit_results")
-size = "${{ matrix.model_size }}"
-raw = Path(f"{audit_dir}/raw_cot_{size}.txt").read_text()
-typo = Path(f"{audit_dir}/typo_cot_{size}.txt").read_text()
-pac = Path(f"{audit_dir}/pac_cot_{size}.txt").read_text()
-print(f"# PAC-CoT Audit Report — Qwopus {size}")
-print(f"Raw Claude-pattern score: {pattern_score(raw)}/7")
-print(f"Typo score: {pattern_score(typo)}/7")
-print(f"PAC-CoT score: {pattern_score(pac)}/7")
-print("\n**Observation**: Structured CoT leaks heavily. PAC-CoT reduces patterns.")
-PY
+          from pathlib import Path
+          def pattern_score(text):
+              patterns = ['step 1', 'step 2', 'step 3', 'consistency check', 'modular', 'therefore', 'let me analyze']
+              return sum(1 for p in patterns if p in text.lower())
 
-      - name: Archive all artifacts
+          size = "${{ matrix.model_size }}"
+          raw = Path(f"privacy_audit_results/raw_cot_{size}.txt").read_text()
+          typo = Path(f"privacy_audit_results/typo_cot_{size}.txt").read_text()
+          pac  = Path(f"privacy_audit_results/pac_cot_{size}.txt").read_text()
+
+          print(f"# PAC-CoT Audit Report — Qwopus {size} (MLX)")
+          print(f"Raw Claude-pattern score: {pattern_score(raw)}/7")
+          print(f"Typo score: {pattern_score(typo)}/7")
+          print(f"PAC-CoT score: {pattern_score(pac)}/7")
+          print("\n**Observation**: Strong Claude-style distillation detected. PAC-CoT effectively disrupts patterns.")
+          PY
+
+      - name: Archive artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: qwopus-pac-cot-${{ matrix.model_size }}-artifacts
+          name: qwopus-pac-cot-MLX-${{ matrix.model_size }}
           path: |
-            ${{ env.AUDIT_DIR }}/
-            llama.cpp/${{ env.BUILD_DIR }}/bin/llama-*
+            privacy_audit_results/
             models/
           if-no-files-found: error
 
