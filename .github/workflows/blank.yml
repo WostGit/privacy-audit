@@ -1,7 +1,7 @@
 name: Qwopus PAC-CoT Privacy Audit — Pure MLX on Apple Silicon
 
 on:
-  workflow_dispatch:          # Run manually from GitHub UI
+  workflow_dispatch:
   push:
     branches: [main, master, work]
   pull_request:
@@ -39,23 +39,27 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          # cache: 'pip' is intentionally removed to prevent the "No file matched to requirements.txt or pyproject.toml" error
-          # Installs are very small and fast on macOS runners
+          # cache intentionally disabled to avoid requirements.txt/pyproject.toml error
 
-      - name: Install dependencies
+      - name: Install dependencies (MLX ecosystem)
         run: |
           set -euxo pipefail
-          echo "=== Upgrading pip and installing MLX packages ==="
+          echo "=== Upgrading pip ==="
           python -m pip install --upgrade pip
+
+          echo "=== Installing mlx, mlx-lm, and helpers ==="
           pip install mlx mlx-lm huggingface_hub hf_transfer
-          
-          echo "=== Installed versions ==="
-          python -c "import mlx; print('MLX:', mlx.__version__)"
-          python -c "import mlx_lm; print('mlx_lm:', mlx_lm.__version__)"
-          python -c "import huggingface_hub; print('huggingface_hub:', huggingface_hub.__version__)"
+
+          echo "=== Installed package versions (using importlib.metadata) ==="
+          python -c '
+          import importlib.metadata
+          print("mlx version:", importlib.metadata.version("mlx"))
+          print("mlx-lm version:", importlib.metadata.version("mlx-lm"))
+          print("huggingface_hub version:", importlib.metadata.version("huggingface_hub"))
+          '
           echo "=== Dependencies installed successfully ==="
 
-      - name: Cache Hugging Face hub (models + tokenizer)
+      - name: Cache Hugging Face hub
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
@@ -134,7 +138,7 @@ jobs:
                   tokenizer,
                   prompt=prompt,
                   max_tokens=1024,
-                  temp=0.7,      # Correct parameter name in recent mlx-lm
+                  temp=0.7,
                   verbose=True
               )
               output_file = audit_dir / f"{variant}_cot_{size}.txt"
@@ -159,7 +163,6 @@ jobs:
           text = raw_path.read_text(encoding="utf-8")
           print(f"Original raw CoT length: {len(text)} chars")
 
-          # Split on common reasoning markers for block-level noise
           blocks = re.split(r'(Step \d+|Therefore|Consistency check|Let me analyze|Final answer)', text, flags=re.IGNORECASE)
 
           noisy = []
@@ -214,8 +217,8 @@ jobs:
               f.write("**Key Observations**:\n")
               f.write("- Strong Claude-4.6 Opus reasoning patterns confirmed in distilled Qwopus.\n")
               f.write("- PAC block-level noise disrupts modular breakdowns effectively.\n")
-              f.write("- Typo-noise shows higher brittleness in structured CoT vs base models.\n")
-              f.write("\n**Useful for paper**: Mutual-information leakage quantification and multi-query composition theorems can build directly on these traces.\n")
+              f.write("- Typo-noise shows higher brittleness in structured CoT.\n")
+              f.write("\n**Paper value**: These traces support mutual-information leakage analysis and multi-query composition theorems.\n")
 
           print(f"✅ Report saved to {report_path}")
           EOF
