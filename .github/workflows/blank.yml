@@ -1,0 +1,209 @@
+name: llama.cpp + Qwopus Privacy Audit (10/10 Publishable Pipeline)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+      - work
+  pull_request:
+
+jobs:
+  audit-and-build:
+    name: audit-${{ matrix.build_name }}-${{ matrix.model_size }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build_name: native
+            cmake_flags: "-DGGML_NATIVE=ON -DGGML_OPENBLAS=OFF"
+            model_size: 2B
+            repo: Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled-GGUF
+          - build_name: native
+            cmake_flags: "-DGGML_NATIVE=ON -DGGML_OPENBLAS=OFF"
+            model_size: 9B
+            repo: Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-GGUF
+          - build_name: openblas
+            cmake_flags: "-DGGML_NATIVE=OFF -DGGML_OPENBLAS=ON"
+            model_size: 2B
+            repo: Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled-GGUF
+
+    env:
+      BUILD_DIR: build
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+      MODEL_REPO: ${{ matrix.repo }}
+      AUDIT_DIR: privacy_audit_results
+      GSM8K_SAMPLE_SIZE: 50
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install baseline tooling
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build git jq python3 python3-pip ca-certificates \
+            cmake clang-15 llvm-15 libopenblas-dev
+
+      - name: Pre-flight hardware audit (AVX2 + F16C + 8GiB contiguous)
+        run: |
+          set -euxo pipefail
+          lscpu
+          flags="$(lscpu | awk -F: '/Flags/ {print $2}')"
+          echo "CPU Flags:${flags}"
+          echo "${flags}" | grep -qw avx2
+          echo "${flags}" | grep -qw f16c
+          python3 - <<'PY'
+          import mmap
+          size = 8 * 1024 * 1024 * 1024
+          print(f"Attempting contiguous virtual memory reservation: {size} bytes")
+          try:
+              mm = mmap.mmap(-1, size, access=mmap.ACCESS_WRITE)
+              page = 2 * 1024 * 1024
+              for i in range(0, size, page):
+                  mm[i:i+1] = b"\x01"
+              mm.close()
+              print("8GiB contiguous virtual memory reservation + touch: PASS")
+          except Exception as exc:
+              raise SystemExit(f"Memory provisioning test failed: {exc}")
+          PY
+
+      - name: Dynamic dependency scan + HF CLI
+        run: |
+          set -euxo pipefail
+          cmake_ver="$(cmake --version | awk 'NR==1 {print $3}')"
+          python3 - <<'PY' "$cmake_ver"
+          import sys
+          from packaging.version import Version
+          if Version(sys.argv[1]) < Version("3.24.0"):
+              raise SystemExit("CMake too old")
+          PY
+          clang-15 --version
+          python3 -m pip install --upgrade pip "huggingface_hub[cli]" packaging
+
+      - name: Authenticate Hugging Face (optional)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euxo pipefail
+          if [ -n "${HF_TOKEN:-}" ]; then
+            huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential || true
+          else
+            echo "HF_TOKEN not set; continuing without login"
+          fi
+
+      - name: Fetch & build llama.cpp
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 https://github.com/ggml-org/llama.cpp.git
+          cd llama.cpp
+          cmake -S . -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=ON \
+            -DLLAMA_CURL=ON \
+            ${{ matrix.cmake_flags }}
+          cmake --build "$BUILD_DIR" --config Release --target llama-bench llama-cli -j"$(nproc)"
+
+      - name: Download Qwopus GGUF model (${{ matrix.model_size }})
+        run: |
+          set -euxo pipefail
+          mkdir -p models
+          huggingface-cli download "$MODEL_REPO" --local-dir models --quiet
+          model_file="$(find models -type f -name '*.gguf' | head -n 1)"
+          echo "MODEL_FILE=$model_file" >> "$GITHUB_ENV"
+          du -h "$model_file"
+
+      - name: Functional verification (50-token bench)
+        working-directory: llama.cpp
+        run: |
+          set -euxo pipefail
+          ./"$BUILD_DIR"/bin/llama-bench \
+            -m "../${{ env.MODEL_FILE }}" \
+            -n 50 -p 32 -t "$(nproc)" -ngl 0
+
+      - name: Create audit directory
+        run: mkdir -p "$AUDIT_DIR"
+
+      - name: 📍 Raw CoT Generation + Claude-pattern baseline
+        working-directory: llama.cpp
+        run: |
+          ./$BUILD_DIR/bin/llama-cli \
+            -m "../${{ env.MODEL_FILE }}" \
+            -p "You are a world-class reasoning engine. Use explicit Claude-style modular breakdowns, Step 1/2/3, consistency checks. Solve step-by-step: What is the 42nd prime number and why?" \
+            -n 1024 --temp 0.7 --repeat-penalty 1.1 -t "$(nproc)" -ngl 0 > "$GITHUB_WORKSPACE/$AUDIT_DIR/raw_cot_${{ matrix.model_size }}.txt"
+
+      - name: 📍 Typo-noise brittleness test
+        working-directory: llama.cpp
+        run: |
+          ./$BUILD_DIR/bin/llama-cli \
+            -m "../${{ env.MODEL_FILE }}" \
+            -p "Y0u ar3 a w0rld-cl4ss r3ason1ng 3ng1n3. Us3 expl1c1t Cl4ud3-styl3 m0dul4r br34kd0wns... Solve step-by-step: What is the 42nd prime number?" \
+            -n 1024 --temp 0.7 -t "$(nproc)" -ngl 0 > "$GITHUB_WORKSPACE/$AUDIT_DIR/typo_cot_${{ matrix.model_size }}.txt"
+
+      - name: 📍 PAC-CoT Defense Simulation (Zhu-style adaptive noise)
+        run: |
+          python3 - <<'PY'
+          import random, re, sys, os
+          input_file = os.path.expandvars("$GITHUB_WORKSPACE/$AUDIT_DIR/raw_cot_${{ matrix.model_size }}.txt")
+          output_file = os.path.expandvars("$GITHUB_WORKSPACE/$AUDIT_DIR/pac_cot_${{ matrix.model_size }}.txt")
+
+          with open(input_file, 'r') as f:
+              text = f.read()
+
+          blocks = re.split(r'(Step \d+|Therefore|Consistency check)', text)
+          noisy_blocks = []
+          for block in blocks:
+              words = block.split()
+              for i in range(len(words)):
+                  if random.random() < 0.12:
+                      if random.random() < 0.5:
+                          words[i] = words[i][::-1] if len(words[i]) > 3 else '***'
+                      else:
+                          words[i] = '[REDACTED]'
+              noisy_blocks.append(' '.join(words))
+          noisy_text = ''.join(noisy_blocks)
+
+          with open(output_file, 'w') as f:
+              f.write(noisy_text)
+          PY
+
+      - name: 📍 Privacy Metrics & Report Generation
+        run: |
+          python3 - <<'PY' > "$AUDIT_DIR/privacy_report_${{ matrix.model_size }}.md"
+          import re, os
+          size = "${{ matrix.model_size }}"
+          raw = open(f"$AUDIT_DIR/raw_cot_{size}.txt").read().lower()
+          typo = open(f"$AUDIT_DIR/typo_cot_{size}.txt").read().lower()
+          pac = open(f"$AUDIT_DIR/pac_cot_{size}.txt").read().lower()
+          
+          patterns = ['step 1', 'step 2', 'step 3', 'consistency check', 'modular', 'therefore']
+          def score(txt): return sum(1 for p in patterns if p in txt)
+          
+          print(f"# Privacy Audit Report - Qwopus {size}")
+          print(f"Raw Claude-pattern score: {score(raw)}/6")
+          print(f"Typo score: {score(typo)}/6")
+          print(f"PAC-CoT score: {score(pac)}/6")
+          PY
+
+      - name: Archive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-${{ matrix.build_name }}-${{ matrix.model_size }}-privacy-artifacts
+          path: |
+            llama.cpp/${{ env.BUILD_DIR }}/bin/llama-bench
+            llama.cpp/${{ env.BUILD_DIR }}/bin/llama-cli
+            models/*.gguf
+            ${{ env.AUDIT_DIR }}/*.txt
+            ${{ env.AUDIT_DIR }}/*.md
+          if-no-files-found: error
+
+      - name: Final Summary
+        run: |
+          echo "✅ Pipeline complete for ${{ matrix.model_size }}"
+          cat "$AUDIT_DIR/privacy_report_${{ matrix.model_size }}.md"
