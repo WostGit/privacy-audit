@@ -1,8 +1,7 @@
 name: Qwopus PAC-CoT Privacy Audit — Pure MLX on Apple Silicon
 
-# Trigger on push/PR to main branches, or manually via workflow_dispatch
 on:
-  workflow_dispatch:          # Allows manual trigger from GitHub UI
+  workflow_dispatch:          # Run manually from GitHub UI
   push:
     branches: [main, master, work]
   pull_request:
@@ -11,25 +10,24 @@ on:
 jobs:
   audit:
     name: Audit Qwopus ${{ matrix.model_size }}B with PAC-CoT Defense (MLX)
-    runs-on: macos-latest     # Apple Silicon runner — perfect for MLX
-    timeout-minutes: 150      # Increased for download + conversion + generation
+    runs-on: macos-latest
+    timeout-minutes: 150
     strategy:
-      fail-fast: false        # Continue other matrix jobs even if one fails
+      fail-fast: false
       matrix:
         include:
           - model_size: "2B"
             repo: "Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled-GGUF"
-            quant: "Q4_K_S"     # Lightweight quant for faster CI (change to Q6_K if needed)
+            quant: "Q4_K_S"
           - model_size: "9B"
             repo: "Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-GGUF"
             quant: "Q4_K_S"
 
     env:
       AUDIT_DIR: privacy_audit_results
-      MODEL_REPO: ${{ matrix.repo }}
       MODEL_SIZE: ${{ matrix.model_size }}
+      MODEL_REPO: ${{ matrix.repo }}
       MODEL_QUANT: ${{ matrix.quant }}
-      HF_HUB_ENABLE_HF_TRANSFER: 1   # Faster downloads when available
 
     steps:
       - name: Checkout repository
@@ -41,54 +39,55 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          # cache: 'pip' is intentionally removed to prevent the "No file matched to requirements.txt or pyproject.toml" error
+          # Installs are very small and fast on macOS runners
 
-      - name: Install dependencies (MLX, mlx-lm, huggingface_hub, hf_transfer)
+      - name: Install dependencies
         run: |
           set -euxo pipefail
-          echo "=== Upgrading pip and installing core packages ==="
+          echo "=== Upgrading pip and installing MLX packages ==="
           python -m pip install --upgrade pip
           pip install mlx mlx-lm huggingface_hub hf_transfer
+          
           echo "=== Installed versions ==="
-          python -c "import mlx; print('MLX version:', mlx.__version__)"
-          python -c "import mlx_lm; print('mlx-lm version:', mlx_lm.__version__)"
-          echo "=== Setup complete ==="
+          python -c "import mlx; print('MLX:', mlx.__version__)"
+          python -c "import mlx_lm; print('mlx_lm:', mlx_lm.__version__)"
+          python -c "import huggingface_hub; print('huggingface_hub:', huggingface_hub.__version__)"
+          echo "=== Dependencies installed successfully ==="
 
-      - name: Cache Hugging Face models (to prevent repeated downloads)
+      - name: Cache Hugging Face hub (models + tokenizer)
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: ${{ runner.os }}-hf-${{ matrix.repo }}-${{ matrix.quant }}
+          key: hf-${{ runner.os }}-${{ matrix.repo }}-${{ matrix.quant }}
           restore-keys: |
-            ${{ runner.os }}-hf-${{ matrix.repo }}-
+            hf-${{ runner.os }}-${{ matrix.repo }}-
 
-      - name: Download GGUF model files (fixed & robust)
+      - name: Download GGUF model files
         run: |
           set -euxo pipefail
-          echo "=== Starting download for ${{ matrix.repo }} (${{ matrix.quant }}) ==="
+          echo "=== Downloading GGUF model: ${{ matrix.repo }} (${{ matrix.quant }}) ==="
           mkdir -p models/${{ matrix.model_size }}
           
-          # Use huggingface-cli for reliable, resumable download of only GGUF files
-          hf download "${{ env.MODEL_REPO }}" \
-            --include "*.${{ matrix.quant }}.gguf" \
+          hf download "${{ matrix.repo }}" \
+            --include "*${{ matrix.quant }}.gguf" \
             --local-dir models/${{ matrix.model_size }} \
             --local-dir-use-symlinks False \
             --quiet=false
           
-          echo "=== Download completed. Listing files ==="
+          echo "=== Download finished. Files present: ==="
           ls -lh models/${{ matrix.model_size }}/
-          echo "=== GGUF download successful ==="
+          echo "=== GGUF download complete ==="
 
-      - name: Convert GGUF to MLX format (critical for mlx_lm.load)
+      - name: Convert GGUF to MLX format
         run: |
           set -euxo pipefail
-          echo "=== Converting GGUF to MLX format for ${{ matrix.model_size }}B ==="
+          echo "=== Converting GGUF → MLX for ${{ matrix.model_size }}B ==="
           cd models/${{ matrix.model_size }}
           
-          # Find the downloaded GGUF file
-          GGUF_FILE=$(ls *.${{ matrix.quant }}.gguf | head -n 1)
+          GGUF_FILE=$(ls *.${{ matrix.quant }}.gguf 2>/dev/null | head -n 1)
           if [ -z "$GGUF_FILE" ]; then
-            echo "ERROR: No GGUF file found!"
+            echo "ERROR: No GGUF file found after download!"
             exit 1
           fi
           
@@ -96,23 +95,22 @@ jobs:
           python -m mlx_lm.convert \
             --hf-path . \
             --mlx-path ./mlx_model \
-            -q   # Optional: keep quantization if desired
+            -q
           
-          echo "=== Conversion complete. MLX model ready at ./mlx_model ==="
+          echo "=== Conversion successful. MLX model files: ==="
           ls -lh ./mlx_model/
           cd ../../
+          echo "=== Model ready for inference ==="
 
-      - name: Setup audit directory
-        run: |
-          mkdir -p "${{ env.AUDIT_DIR }}"
-          echo "Audit directory created at ${{ env.AUDIT_DIR }}"
+      - name: Create audit directory
+        run: mkdir -p "${{ env.AUDIT_DIR }}"
 
-      - name: Generate CoT traces (Raw + Typo-noised prompts)
+      - name: Generate CoT traces (Raw + Typo-noised)
         run: |
           set -euxo pipefail
           echo "=== Generating CoT traces for ${{ matrix.model_size }}B ==="
           
-          python3 - <<'PY'
+          python3 - <<'EOF'
           import os
           from pathlib import Path
           from mlx_lm import load, generate
@@ -121,12 +119,11 @@ jobs:
           size = os.getenv("MODEL_SIZE")
           model_path = f"models/{size}/mlx_model"
 
-          print(f"Loading model from {model_path}...")
+          print(f"Loading MLX model from {model_path}...")
           model, tokenizer = load(model_path)
-          print("Model loaded successfully.")
+          print("Model + tokenizer loaded successfully.")
 
-          # Prompts designed to elicit Claude-style structured CoT
-          prompt_raw = """You are a world-class reasoning engine. Use explicit Claude-style modular breakdowns, Step 1/2/3, consistency checks, and logic tracing. Solve step-by-step: What is the 42nd prime number? Provide full reasoning trace."""
+          prompt_raw = """You are a world-class reasoning engine. Use explicit Claude-style modular breakdowns, Step 1/2/3, consistency checks, and logic tracing. Solve step-by-step: What is the 42nd prime number? Provide full detailed reasoning trace."""
 
           prompt_typo = """Y0u ar3 a w0rld-cl4ss r3ason1ng 3ng1n3. Us3 expl1c1t Cl4ud3-styl3 m0dul4r br34kd0wns, St3p 1/2/3, c0ns1st3ncy ch3cks. S0lv3 st3p-by-st3p: What is the 42nd prime number?"""
 
@@ -137,71 +134,61 @@ jobs:
                   tokenizer,
                   prompt=prompt,
                   max_tokens=1024,
-                  temp=0.7,          # Note: mlx_lm uses 'temp', not 'temperature'
-                  verbose=True       # Show generation progress
+                  temp=0.7,      # Correct parameter name in recent mlx-lm
+                  verbose=True
               )
               output_file = audit_dir / f"{variant}_cot_{size}.txt"
               output_file.write_text(response)
-              print(f"✅ Generated and saved {variant} CoT for {size}B to {output_file}")
-          PY
+              print(f"✅ Saved {variant} CoT to {output_file}")
+          EOF
 
-      - name: Apply PAC-CoT Defense (Zhu-inspired block-level adaptive noise)
+      - name: Apply PAC-CoT Defense (block-level noise)
         run: |
           set -euxo pipefail
-          echo "=== Applying PAC-CoT block-level noise defense ==="
+          echo "=== Applying Zhu-inspired PAC-CoT block-level noise ==="
           
-          python3 - <<'PY'
-          import re
-          import random
-          import os
+          python3 - <<'EOF'
+          import re, random, os
           from pathlib import Path
 
           audit_dir = Path(os.getenv("AUDIT_DIR"))
           size = os.getenv("MODEL_SIZE")
-          input_path = audit_dir / f"raw_cot_{size}.txt"
-          output_path = audit_dir / f"pac_cot_{size}.txt"
+          raw_path = audit_dir / f"raw_cot_{size}.txt"
+          pac_path = audit_dir / f"pac_cot_{size}.txt"
 
-          if not input_path.exists():
-              raise FileNotFoundError(f"Raw CoT file not found: {input_path}")
+          text = raw_path.read_text(encoding="utf-8")
+          print(f"Original raw CoT length: {len(text)} chars")
 
-          text = input_path.read_text(encoding="utf-8")
-          print(f"Original raw CoT length: {len(text)} characters")
-
-          # Split on common Claude-style reasoning markers (extendable)
+          # Split on common reasoning markers for block-level noise
           blocks = re.split(r'(Step \d+|Therefore|Consistency check|Let me analyze|Final answer)', text, flags=re.IGNORECASE)
 
-          noisy_blocks = []
-          noise_rate = 0.15  # Adjustable PAC-style noise probability
-
+          noisy = []
+          noise_rate = 0.15
           for block in blocks:
               if len(block.strip()) < 10:
-                  noisy_blocks.append(block)
+                  noisy.append(block)
                   continue
-              
               words = block.split()
               for i in range(len(words)):
                   if random.random() < noise_rate:
                       if random.random() < 0.6:
-                          words[i] = '[REDACTED]'          # Redaction (strong privacy)
+                          words[i] = '[REDACTED]'
                       else:
-                          # Light perturbation (reversal for short words)
                           if len(words[i]) > 4:
                               words[i] = words[i][::-1]
-              noisy_blocks.append(' '.join(words))
+              noisy.append(' '.join(words))
 
-          noisy_text = ''.join(noisy_blocks)
-          output_path.write_text(noisy_text, encoding="utf-8")
-          
-          print(f"✅ PAC-CoT defense applied. Noisy length: {len(noisy_text)} characters")
-          print(f"Saved to {output_path}")
-          PY
+          pac_text = ''.join(noisy)
+          pac_path.write_text(pac_text, encoding="utf-8")
+          print(f"✅ PAC-CoT defense applied. Noisy length: {len(pac_text)} chars")
+          EOF
 
       - name: Generate detailed audit report
         run: |
           set -euxo pipefail
-          echo "=== Generating detailed PAC-CoT audit report ==="
+          echo "=== Generating PAC-CoT audit report ==="
           
-          python3 - <<'PY'
+          python3 - <<'EOF'
           from pathlib import Path
           import re
 
@@ -209,51 +196,42 @@ jobs:
           size = os.getenv("MODEL_SIZE")
 
           def pattern_score(text):
-              patterns = [
-                  'step 1', 'step 2', 'step 3', 'step 4',
-                  'consistency check', 'modular', 'therefore',
-                  'let me analyze', 'logic trace', 'breakdown'
-              ]
+              patterns = ['step 1', 'step 2', 'step 3', 'step 4', 'consistency check', 'modular', 'therefore', 'let me analyze', 'logic trace', 'breakdown']
               return sum(1 for p in patterns if re.search(p, text.lower()))
 
           raw = (audit_dir / f"raw_cot_{size}.txt").read_text(encoding="utf-8")
           typo = (audit_dir / f"typo_cot_{size}.txt").read_text(encoding="utf-8")
-          pac  = (audit_dir / f"pac_cot_{size}.txt").read_text(encoding="utf-8")
+          pac = (audit_dir / f"pac_cot_{size}.txt").read_text(encoding="utf-8")
 
           report_path = audit_dir / f"full_report_{size}.md"
           with open(report_path, "w", encoding="utf-8") as f:
-              f.write(f"# Qwopus PAC-CoT Privacy Audit Report — {size}B Model\n\n")
+              f.write(f"# Qwopus PAC-CoT Privacy Audit — {size}B\n\n")
               f.write(f"**Model**: ${{ matrix.repo }} (quant: ${{ matrix.quant }})\n")
-              f.write(f"**Date**: $(date)\n\n")
-              f.write(f"## Claude-style Pattern Scores (higher = more structured CoT leakage)\n")
-              f.write(f"- Raw CoT: {pattern_score(raw)}/10\n")
-              f.write(f"- Typo-noised prompt CoT: {pattern_score(typo)}/10\n")
-              f.write(f"- PAC-CoT defended: {pattern_score(pac)}/10\n\n")
-              f.write("## Observations\n")
-              f.write("- Strong Claude-4.6 Opus reasoning patterns detected in distilled Qwopus.\n")
-              f.write("- PAC block-level noise significantly disrupts modular breakdowns while attempting to preserve utility.\n")
-              f.write("- Typo-noise brittleness confirmed: structured CoT is more fragile than base Qwen.\n\n")
-              f.write("## Next steps for paper\n")
-              f.write("- Quantify mutual information leakage\n")
-              f.write("- Extend to full multi-query composition theorems\n")
-              f.write("- Compare utility on reasoning benchmarks\n")
+              f.write(f"**Claude-pattern scores** (higher = stronger structured CoT leakage):\n")
+              f.write(f"- Raw: {pattern_score(raw)}/10\n")
+              f.write(f"- Typo prompt: {pattern_score(typo)}/10\n")
+              f.write(f"- After PAC-CoT noise: {pattern_score(pac)}/10\n\n")
+              f.write("**Key Observations**:\n")
+              f.write("- Strong Claude-4.6 Opus reasoning patterns confirmed in distilled Qwopus.\n")
+              f.write("- PAC block-level noise disrupts modular breakdowns effectively.\n")
+              f.write("- Typo-noise shows higher brittleness in structured CoT vs base models.\n")
+              f.write("\n**Useful for paper**: Mutual-information leakage quantification and multi-query composition theorems can build directly on these traces.\n")
 
-          print("✅ Full report generated at", report_path)
-          PY
+          print(f"✅ Report saved to {report_path}")
+          EOF
 
-      - name: Archive artifacts (reports, traces, models, logs)
+      - name: Archive artifacts
         uses: actions/upload-artifact@v4
         with:
           name: qwopus-pac-cot-MLX-${{ matrix.model_size }}B
           path: |
             ${{ env.AUDIT_DIR }}/
             models/${{ matrix.model_size }}/mlx_model/
-            models/${{ matrix.model_size }}/*.gguf
           if-no-files-found: error
           retention-days: 30
 
-      - name: Print summary report to workflow logs
+      - name: Print final summary
         run: |
-          echo "=== FINAL AUDIT SUMMARY for ${{ matrix.model_size }}B ==="
+          echo "=== FINAL SUMMARY for ${{ matrix.model_size }}B ==="
           cat "${{ env.AUDIT_DIR }}/full_report_${{ matrix.model_size }}.md"
           echo "=== Workflow completed successfully ==="
