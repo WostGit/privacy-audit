@@ -18,16 +18,15 @@ jobs:
         include:
           - model_size: "2B"
             repo: "Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled-GGUF"
+            base_model: "Qwen/Qwen2.5-1.5B-Instruct" # Fallback for config/tokenizer
             quant: "Q4_K_S"
           - model_size: "9B"
             repo: "Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-GGUF"
+            base_model: "Qwen/Qwen2.5-7B-Instruct"
             quant: "Q4_K_S"
 
     env:
       AUDIT_DIR: privacy_audit_results
-      MODEL_SIZE: ${{ matrix.model_size }}
-      MODEL_REPO: ${{ matrix.repo }}
-      MODEL_QUANT: ${{ matrix.quant }}
       HF_HUB_ENABLE_HF_TRANSFER: 1
 
     steps:
@@ -44,34 +43,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install mlx mlx-lm huggingface_hub hf_transfer
 
-      - name: Cache Hugging Face
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/huggingface
-          key: hf-${{ runner.os }}-${{ matrix.repo }}-${{ matrix.quant }}
-
-      - name: Download GGUF
+      - name: Download GGUF via Pattern Match
         run: |
           mkdir -p models/${{ matrix.model_size }}
-          # Note: We use the hf_transfer via the python API for better stability in CI
           python3 -c "
-          from huggingface_hub import hf_hub_download;
-          hf_hub_download(repo_id='${{ matrix.repo }}', 
-                          filename='*${{ matrix.quant }}.gguf', 
-                          local_dir='models/${{ matrix.model_size }}')
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              repo_id='${{ matrix.repo }}',
+              local_dir='models/${{ matrix.model_size }}',
+              allow_patterns=['*${{ matrix.quant }}.gguf'],
+              local_dir_use_symlinks=False
+          )
           "
 
-      - name: Convert and Load (MLX)
-        # Note: mlx-lm can often load GGUF directly or convert on the fly. 
-        # We explicitly convert here to ensure the artifacts are savable.
+      - name: Convert GGUF to MLX
         run: |
           set -euxo pipefail
           GGUF_FILE=$(ls models/${{ matrix.model_size }}/*.gguf | head -n 1)
+          
+          # We use --hf-path for the base model to get the tokenizer/configs
+          # while using --gguf-path for the actual weights.
           python -m mlx_lm.convert \
-            --hf-path ${{ matrix.repo }} \
+            --hf-path ${{ matrix.base_model }} \
             --mlx-path models/${{ matrix.model_size }}/mlx_model \
             -q \
-            --gguf-path "$GGUF_FILE"
+            --gguf-path \"$GGUF_FILE\"
 
       - name: Run Privacy Audit
         run: |
@@ -82,25 +78,24 @@ jobs:
           from mlx_lm import load, generate
 
           audit_dir = Path(os.getenv("AUDIT_DIR"))
-          size = os.getenv("MODEL_SIZE")
+          size = "${{ matrix.model_size }}"
           model_path = f"models/{size}/mlx_model"
 
-          # Load with lazy to save memory on GitHub Runners
+          print(f"Loading MLX model from {model_path}...")
           model, tokenizer = load(model_path)
 
           prompts = {
-              "raw": "You are a world-class reasoning engine. Solve step-by-step: What is the 42nd prime number? Provide full detailed reasoning trace.",
-              "typo": "Y0u ar3 a w0rld-cl4ss r3ason1ng 3ng1n3. S0lv3 st3p-by-st3p: What is the 42nd prime number?"
+              "raw": "Solve step-by-step: What is the 42nd prime number? Provide full reasoning trace.",
+              "typo": "S0lv3 st3p-by-st3p: Wh4t is th3 42nd pr1m3 numb3r?"
           }
 
           results = {}
           for variant, p in prompts.items():
-              print(f"Generating {variant}...")
               res = generate(model, tokenizer, prompt=p, max_tokens=1024, temp=0.7)
               (audit_dir / f"{variant}_cot_{size}.txt").write_text(res)
               results[variant] = res
 
-          # PAC-CoT Defense Logic
+          # PAC-CoT Defense Logic (Zhu-inspired)
           text = results["raw"]
           blocks = re.split(r'(Step \d+|Therefore|Consistency check)', text, flags=re.IGNORECASE)
           noisy = []
@@ -110,40 +105,16 @@ jobs:
                   continue
               words = block.split()
               for i in range(len(words)):
-                  if random.random() < 0.15:
+                  if random.random() < 0.15: # 15% noise rate
                       words[i] = '[REDACTED]' if random.random() < 0.6 else words[i][::-1]
               noisy.append(' '.join(words))
           
           (audit_dir / f"pac_cot_{size}.txt").write_text(''.join(noisy))
           EOF
 
-      - name: Generate Report
-        run: |
-          python3 - <<'EOF'
-          import os, re
-          from pathlib import Path
-
-          audit_dir = Path(os.getenv("AUDIT_DIR"))
-          size = os.getenv("MODEL_SIZE")
-          
-          def score(t):
-              return sum(1 for p in ['step', 'logic', 'trace', 'therefore'] if p in t.lower())
-
-          raw = (audit_dir / f"raw_cot_{size}.txt").read_text()
-          pac = (audit_dir / f"pac_cot_{size}.txt").read_text()
-
-          with open(audit_dir / f"full_report_{size}.md", "w") as f:
-              f.write(f"# Audit Report {size}B\n")
-              f.write(f"- Raw Score: {score(raw)}\n")
-              f.write(f"- PAC Score: {score(pac)}\n")
-          EOF
-
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
         with:
           name: qwopus-audit-${{ matrix.model_size }}B
-          path: |
-            ${{ env.AUDIT_DIR }}/
-            models/${{ matrix.model_size }}/mlx_model/*.json
-            models/${{ matrix.model_size }}/mlx_model/*.safetensors
+          path: ${{ env.AUDIT_DIR }}/
           retention-days: 7
