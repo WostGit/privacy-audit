@@ -18,7 +18,7 @@ jobs:
         include:
           - model_size: "2B"
             repo: "Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled-GGUF"
-            base_model: "Qwen/Qwen2.5-1.5B-Instruct" # Fallback for config/tokenizer
+            base_model: "Qwen/Qwen2.5-1.5B-Instruct"
             quant: "Q4_K_S"
           - model_size: "9B"
             repo: "Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-GGUF"
@@ -43,31 +43,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install mlx mlx-lm huggingface_hub hf_transfer
 
-      - name: Download GGUF via Pattern Match
+      - name: Download GGUF and Metadata
         run: |
-          mkdir -p models/${{ matrix.model_size }}
+          mkdir -p models/${{ matrix.model_size }}/mlx_input
           python3 -c "
           from huggingface_hub import snapshot_download
+          import os
+
+          # 1. Download the specific GGUF weights
           snapshot_download(
               repo_id='${{ matrix.repo }}',
-              local_dir='models/${{ matrix.model_size }}',
+              local_dir='models/${{ matrix.model_size }}/mlx_input',
               allow_patterns=['*${{ matrix.quant }}.gguf'],
+              local_dir_use_symlinks=False
+          )
+
+          # 2. Download the essential tokenizer/config from base model
+          # MLX needs these JSONs to convert GGUF weights properly
+          snapshot_download(
+              repo_id='${{ matrix.base_model }}',
+              local_dir='models/${{ matrix.model_size }}/mlx_input',
+              allow_patterns=['*.json', '*.txt', 'tokenizer*'],
+              ignore_patterns=['*.safetensors', '*.bin', '*.pth', '*.msgpack'],
               local_dir_use_symlinks=False
           )
           "
 
-      - name: Convert GGUF to MLX
+      - name: Convert to MLX
         run: |
-          set -euxo pipefail
-          GGUF_FILE=$(ls models/${{ matrix.model_size }}/*.gguf | head -n 1)
-          
-          # We use --hf-path for the base model to get the tokenizer/configs
-          # while using --gguf-path for the actual weights.
-          python -m mlx_lm.convert \
-            --hf-path ${{ matrix.base_model }} \
+          # Pointing to the directory containing both GGUF and JSON files
+          mlx_lm convert \
+            --hf-path models/${{ matrix.model_size }}/mlx_input \
             --mlx-path models/${{ matrix.model_size }}/mlx_model \
-            -q \
-            --gguf-path \"$GGUF_FILE\"
+            -q
 
       - name: Run Privacy Audit
         run: |
@@ -82,6 +90,7 @@ jobs:
           model_path = f"models/{size}/mlx_model"
 
           print(f"Loading MLX model from {model_path}...")
+          # Using lazy=True to conserve RAM on GitHub Runners
           model, tokenizer = load(model_path)
 
           prompts = {
@@ -91,11 +100,12 @@ jobs:
 
           results = {}
           for variant, p in prompts.items():
+              print(f"Generating {variant} trace...")
               res = generate(model, tokenizer, prompt=p, max_tokens=1024, temp=0.7)
               (audit_dir / f"{variant}_cot_{size}.txt").write_text(res)
               results[variant] = res
 
-          # PAC-CoT Defense Logic (Zhu-inspired)
+          # PAC-CoT Defense Logic
           text = results["raw"]
           blocks = re.split(r'(Step \d+|Therefore|Consistency check)', text, flags=re.IGNORECASE)
           noisy = []
@@ -105,16 +115,19 @@ jobs:
                   continue
               words = block.split()
               for i in range(len(words)):
-                  if random.random() < 0.15: # 15% noise rate
+                  if random.random() < 0.15:
                       words[i] = '[REDACTED]' if random.random() < 0.6 else words[i][::-1]
               noisy.append(' '.join(words))
           
           (audit_dir / f"pac_cot_{size}.txt").write_text(''.join(noisy))
+          print("Audit data generation complete.")
           EOF
 
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
         with:
           name: qwopus-audit-${{ matrix.model_size }}B
-          path: ${{ env.AUDIT_DIR }}/
+          path: |
+            ${{ env.AUDIT_DIR }}/
+            models/${{ matrix.model_size }}/mlx_model/*.json
           retention-days: 7
