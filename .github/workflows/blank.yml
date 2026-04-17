@@ -58,8 +58,7 @@ jobs:
               local_dir_use_symlinks=False
           )
 
-          # 2. Download the essential tokenizer/config from base model
-          # MLX needs these JSONs to convert GGUF weights properly
+          # 2. Download essential tokenizer/config from base model
           snapshot_download(
               repo_id='${{ matrix.base_model }}',
               local_dir='models/${{ matrix.model_size }}/mlx_input',
@@ -69,11 +68,16 @@ jobs:
           )
           "
 
-      - name: Convert to MLX
+      - name: Convert GGUF to MLX
         run: |
-          # Pointing to the directory containing both GGUF and JSON files
+          # Dynamically find the GGUF file path
+          GGUF_PATH=$(ls models/${{ matrix.model_size }}/mlx_input/*.gguf | head -n 1)
+          echo "Converting GGUF at: $GGUF_PATH"
+          
+          # Use --hf-path for the JSONs and --gguf-path for the weights
           mlx_lm convert \
             --hf-path models/${{ matrix.model_size }}/mlx_input \
+            --gguf-path \"$GGUF_PATH\" \
             --mlx-path models/${{ matrix.model_size }}/mlx_model \
             -q
 
@@ -90,7 +94,7 @@ jobs:
           model_path = f"models/{size}/mlx_model"
 
           print(f"Loading MLX model from {model_path}...")
-          # Using lazy=True to conserve RAM on GitHub Runners
+          # load() automatically handles tokenizer/config in the mlx_model dir
           model, tokenizer = load(model_path)
 
           prompts = {
@@ -120,7 +124,6 @@ jobs:
               noisy.append(' '.join(words))
           
           (audit_dir / f"pac_cot_{size}.txt").write_text(''.join(noisy))
-          print("Audit data generation complete.")
           EOF
 
       - name: Archive artifacts
