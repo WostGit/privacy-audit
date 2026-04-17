@@ -46,16 +46,14 @@ jobs:
           set -euxo pipefail
           echo "=== Upgrading pip ==="
           python -m pip install --upgrade pip
-
           echo "=== Installing mlx, mlx-lm, and helpers ==="
           pip install mlx mlx-lm huggingface_hub hf_transfer
-
-          echo "=== Installed package versions (using importlib.metadata) ==="
+          echo "=== Installed package versions ==="
           python -c '
-          import importlib.metadata
-          print("mlx version:", importlib.metadata.version("mlx"))
-          print("mlx-lm version:", importlib.metadata.version("mlx-lm"))
-          print("huggingface_hub version:", importlib.metadata.version("huggingface_hub"))
+            import importlib.metadata
+            print("mlx version:", importlib.metadata.version("mlx"))
+            print("mlx-lm version:", importlib.metadata.version("mlx-lm"))
+            print("huggingface_hub version:", importlib.metadata.version("huggingface_hub"))
           '
           echo "=== Dependencies installed successfully ==="
 
@@ -67,16 +65,18 @@ jobs:
           restore-keys: |
             hf-${{ runner.os }}-${{ matrix.repo }}-
 
-      - name: Download GGUF model files
+      - name: Download GGUF model files (fixed: removed unsupported --local-dir-use-symlinks)
         run: |
           set -euxo pipefail
           echo "=== Downloading GGUF model: ${{ matrix.repo }} (${{ matrix.quant }}) ==="
           mkdir -p models/${{ matrix.model_size }}
           
+          # Fixed command: removed --local-dir-use-symlinks (no longer supported in current hf CLI)
+          # --local-dir still works and places files directly in the target folder
           hf download "${{ matrix.repo }}" \
             --include "*${{ matrix.quant }}.gguf" \
             --local-dir models/${{ matrix.model_size }} \
-            --local-dir-use-symlinks False \
+            --force-download \
             --quiet=false
           
           echo "=== Download finished. Files present: ==="
@@ -209,7 +209,7 @@ jobs:
           report_path = audit_dir / f"full_report_{size}.md"
           with open(report_path, "w", encoding="utf-8") as f:
               f.write(f"# Qwopus PAC-CoT Privacy Audit — {size}B\n\n")
-              f.write(f"**Model**: ${{ matrix.repo }} (quant: ${{ matrix.quant }})\n")
+              f.write(f"**Model**: {os.getenv('MODEL_REPO')} (quant: {os.getenv('MODEL_QUANT')})\n")
               f.write(f"**Claude-pattern scores** (higher = stronger structured CoT leakage):\n")
               f.write(f"- Raw: {pattern_score(raw)}/10\n")
               f.write(f"- Typo prompt: {pattern_score(typo)}/10\n")
