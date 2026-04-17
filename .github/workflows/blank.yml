@@ -59,6 +59,7 @@ jobs:
           )
 
           # 2. Download essential tokenizer/config from base model
+          # MLX requires these JSON files to structure the converted model
           snapshot_download(
               repo_id='${{ matrix.base_model }}',
               local_dir='models/${{ matrix.model_size }}/mlx_input',
@@ -70,11 +71,11 @@ jobs:
 
       - name: Convert GGUF to MLX
         run: |
-          # Dynamically find the GGUF file path
+          # Dynamically locate the GGUF file
           GGUF_PATH=$(ls models/${{ matrix.model_size }}/mlx_input/*.gguf | head -n 1)
-          echo "Converting GGUF at: $GGUF_PATH"
+          echo "Converting: $GGUF_PATH"
           
-          # Use --hf-path for the JSONs and --gguf-path for the weights
+          # Explicitly pass --gguf-path to prevent FileNotFoundError (safetensors check)
           mlx_lm convert \
             --hf-path models/${{ matrix.model_size }}/mlx_input \
             --gguf-path \"$GGUF_PATH\" \
@@ -94,7 +95,6 @@ jobs:
           model_path = f"models/{size}/mlx_model"
 
           print(f"Loading MLX model from {model_path}...")
-          # load() automatically handles tokenizer/config in the mlx_model dir
           model, tokenizer = load(model_path)
 
           prompts = {
